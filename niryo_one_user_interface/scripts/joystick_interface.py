@@ -17,9 +17,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import rospy, actionlib
+import rospy
+import actionlib
+import threading
 
 from std_msgs.msg import Bool
+from std_msgs.msg import Int32
 from sensor_msgs.msg import Joy
 
 from sensor_msgs.msg import JointState
@@ -29,6 +32,9 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from niryo_one_msgs.srv import GetInt
 from niryo_one_msgs.srv import SetInt
 
+from niryo_one_msgs.msg import ToolAction
+from niryo_one_msgs.msg import ToolGoal
+from niryo_one_msgs.msg import ToolCommand
 
 # AXES index table
 AXE_JOY_L_H = 0
@@ -66,6 +72,20 @@ MIN_MULTIPLIER = 0.01
 DEFAULT_MULTIPLIER = 0.07
 STEP_MULTIPLIER = 0.01
 
+# Tools IDs (need to match tools ids in niryo_one_tools package)
+TOOL_NONE = 0
+TOOL_GRIPPER_1_ID = 11
+TOOL_GRIPPER_2_ID = 12
+TOOL_GRIPPER_3_ID = 13
+TOOL_ELECTROMAGNET_1_ID = 30
+TOOL_VACUUM_PUMP_1_ID = 31
+
+# Tool commands
+TOOL_OPEN_GRIPPER = 1
+TOOL_CLOSE_GRIPPER = 2
+TOOL_ACTIVATE_VP = 10
+TOOL_DEACTIVATE_VP = 11
+
 class JointMode:
 
     def __init__(self):
@@ -78,25 +98,41 @@ class JointMode:
         self.synchronization_needed = True
         self.is_enabled = False
 
-        self.joint_state_subscriber = rospy.Subscriber('/joint_states', 
-                JointState, self.callback_joint_states)
-        
-        self.learning_mode_subscriber = rospy.Subscriber(
-                '/niryo_one/learning_mode', Bool, self.callback_learning_mode)
-
-        self.joint_trajectory_publisher = rospy.Publisher(
-                '/niryo_one_follow_joint_trajectory_controller/command',
-                JointTrajectory, queue_size=10)
-
         self.axes = [0,0,0,0,0,0,0,0]
         self.buttons = [0,0,0,0,0,0,0,0,0,0,0]
         self.joint_states = JointState()
         self.joint_cmd = [0,0,0,0,0,0]
         self.multiplier = DEFAULT_MULTIPLIER
         self.learning_mode_on = True
+        self.current_tool_id = 0
+        self.is_tool_active = False
+        
+        self.joint_state_subscriber = rospy.Subscriber('/joint_states', 
+                JointState, self.callback_joint_states)
+        
+        self.learning_mode_subscriber = rospy.Subscriber(
+                '/niryo_one/learning_mode', Bool, self.callback_learning_mode)
+
+        self.current_tool_id_subscriber = rospy.Subscriber(
+                "/niryo_one/current_tool_id", Int32, self.callback_current_tool_id)
+
+        self.joint_trajectory_publisher = rospy.Publisher(
+                '/niryo_one_follow_joint_trajectory_controller/command',
+                JointTrajectory, queue_size=10)
+        
+        # Publisher used to send info to Niryo One Studio, so the user can add a move block
+        # by pressing a button on the joystick controller
+        self.save_point_publisher = rospy.Publisher(
+                "/niryo_one/blockly/save_current_point", Int32, queue_size=10)
+        
+        self.tool_action_client = actionlib.SimpleActionClient(
+            'niryo_one/tool_action', ToolAction)
+        self.tool_action_client.wait_for_server()
         
         self.joint_mode_timer = rospy.Timer(rospy.Duration(self.timer_rate), self.send_joint_trajectory)
         self.time_debounce_start_button = rospy.Time.now()
+        self.time_debounce_A_button = rospy.Time.now()
+        self.time_debounce_B_X_button = rospy.Time.now() # common debounce for both buttons
         
     def increase_speed(self):
         self.multiplier += STEP_MULTIPLIER
@@ -107,21 +143,41 @@ class JointMode:
         self.multiplier -= STEP_MULTIPLIER
         if self.multiplier < MIN_MULTIPLIER:
             self.multiplier = MIN_MULTIPLIER
+    
+    def blockly_save_current_point(self):
+        msg = Int32()
+        msg.data = 1
+        self.save_point_publisher.publish(msg)
 
     def process_joy_message(self, joy):
         self.axes = joy.axes
         self.buttons = joy.buttons
         
         if self.buttons[BUTTON_RB]:
-            self.decrease_speed()
-        elif self.buttons[BUTTON_LB]:
             self.increase_speed()
+        elif self.buttons[BUTTON_LB]:
+            self.decrease_speed()
 
         if self.buttons[BUTTON_START]:
             if rospy.Time.now() > self.time_debounce_start_button:
                 self.time_debounce_start_button = rospy.Time.now() + rospy.Duration(0.5) # debounce 0.5 sec
                 self.set_learning_mode()
                 self.synchronization_needed = True
+
+        if self.buttons[BUTTON_A]:
+            if rospy.Time.now() > self.time_debounce_A_button:
+                self.time_debounce_A_button = rospy.Time.now() + rospy.Duration(0.2)
+                self.blockly_save_current_point()
+
+        if self.buttons[BUTTON_X]:
+            if rospy.Time.now() > self.time_debounce_B_X_button:
+                self.time_debounce_B_X_button = rospy.Time.now() + rospy.Duration(0.1)
+                self.execute_tool_action(True)
+
+        if self.buttons[BUTTON_B]:
+            if rospy.Time.now() > self.time_debounce_B_X_button:
+                self.time_debounce_B_X_button = rospy.Time.now() + rospy.Duration(0.1)
+                self.execute_tool_action(False)
    
     def set_learning_mode(self):
         rospy.wait_for_service('niryo_one/activate_learning_mode')
@@ -133,6 +189,40 @@ class JointMode:
                 reset(1)
         except rospy.ServiceException, e:
             rospy.logwarn("Could not set learning mode")
+
+    def execute_tool_action(self, activate):
+        if self.is_tool_active:
+            return
+        
+        cmd_type = 0
+        # Check which tool
+        if self.current_tool_id in [TOOL_GRIPPER_1_ID, TOOL_GRIPPER_2_ID, TOOL_GRIPPER_3_ID]:
+            # Send gripper command
+            cmd_type = TOOL_OPEN_GRIPPER if activate else TOOL_CLOSE_GRIPPER
+        elif self.current_tool_id in [TOOL_VACUUM_PUMP_1_ID]:
+            # Send vacuum pump command
+            cmd_type = TOOL_ACTIVATE_VP if activate else TOOL_DEACTIVATE_VP
+        else:
+            # No selected tool or (no gripper and no vacuum pump)
+            return
+        
+        w = threading.Thread(target=self.send_tool_command, args=[self.current_tool_id, cmd_type])
+        w.start()
+
+    def send_tool_command(self, tool_id, cmd_type):
+        self.is_tool_active = True
+        if self.learning_mode_on:
+            self.set_learning_mode()
+        tool_cmd = ToolCommand()
+        tool_cmd.tool_id = tool_id
+        tool_cmd.cmd_type = cmd_type
+        tool_cmd.gripper_close_speed = 500
+        tool_cmd.gripper_open_speed = 500
+        goal = ToolGoal()
+        goal.cmd = tool_cmd
+        self.tool_action_client.send_goal(goal)
+        self.tool_action_client.wait_for_result()
+        self.is_tool_active = False
 
     def enable(self):
         self.is_enabled = True
@@ -154,6 +244,9 @@ class JointMode:
 
     def callback_learning_mode(self, msg):
         self.learning_mode_on = msg.data
+
+    def callback_current_tool_id(self, msg):
+        self.current_tool_id = msg.data
 
     def send_joint_trajectory(self, event):
         if not self.is_enabled:
