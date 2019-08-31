@@ -89,7 +89,7 @@ bool FakeCommunication::isConnectionOk()
 int FakeCommunication::allowMotorsCalibrationToStart(int mode, std::string &result_message)
 {
     ROS_INFO("Motor calibration with mode : %d", mode);
-    return 1;
+    return 200;
 }
 
 void FakeCommunication::requestNewCalibration() 
@@ -120,6 +120,11 @@ void FakeCommunication::addCustomDxlCommand(int motor_type, uint8_t id, uint32_t
         uint32_t reg_address, uint32_t byte_number)
 {
     ROS_INFO("Add custom Dxl command");
+}
+
+void FakeCommunication::rebootMotors()
+{
+    ROS_INFO("Reboot Motors");
 }
         
 void FakeCommunication::getHardwareStatus(bool *is_connection_ok, std::string &error_message, 
